@@ -5,5 +5,5 @@ Commit + push to GitHub and Railway redeploys; the bot leaves any server not lis
 """
 
 ALLOWED_GUILD_IDS = {
-    # 123456789012345678,  # Customer name / order #
+    # 1565488985617334373,  # Customer name / order #
 }
