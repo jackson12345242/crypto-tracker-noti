@@ -28,7 +28,8 @@ log = logging.getLogger("cryptobot")
 
 TOKEN = os.environ["DISCORD_TOKEN"]
 POLL_SECONDS = max(5, int(os.getenv("POLL_SECONDS", "30")))
-MIN_CHANGE_PCT = float(os.getenv("MIN_CHANGE_PCT", "0.1"))  # 0 = post on ANY change
+ALWAYS_POST = os.getenv("ALWAYS_POST", "1") == "1"  # 1 = post every check, even if price is unchanged
+MIN_CHANGE_PCT = float(os.getenv("MIN_CHANGE_PCT", "0.1"))  # only used when ALWAYS_POST=0  # 0 = post on ANY change
 AI_CACHE_SECONDS = int(os.getenv("AI_CACHE_SECONDS", "600"))
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5")
@@ -295,10 +296,12 @@ def add_analysis(embed, analysis):
 
 def move_embed(row, price, prev, ch24, analysis):
     up = price > prev
+    flat = price == prev
     pct = (price - prev) / prev * 100
     e = discord.Embed(
-        title=f"{'📈' if up else '📉'} {disp(row)} {'rose' if up else 'dropped'}",
-        color=discord.Color.green() if up else discord.Color.red(),
+        title=f"{'📊' if flat else '📈' if up else '📉'} {disp(row)} "
+              f"{'unchanged' if flat else 'rose' if up else 'dropped'}",
+        color=discord.Color.light_grey() if flat else discord.Color.green() if up else discord.Color.red(),
         timestamp=datetime.now(timezone.utc))
     e.add_field(name="Price", value=fmt_price(price))
     e.add_field(name="Change", value=f"{pct:+.2f}% (from {fmt_price(prev)})")
@@ -342,8 +345,9 @@ async def track_coin(guild: discord.Guild, coin_id, symbol, name):
     try:
         cur = (await kraken.prices([coin_id])).get(coin_id)
         e = discord.Embed(title=f"📡 Tracking {name if name == symbol.upper() else f'{name} ({symbol.upper()})'}",
-                          description="I'll post here whenever the price moves"
-                                      + (f" {MIN_CHANGE_PCT}% or more." if MIN_CHANGE_PCT else "."),
+                          description=(f"I'll post here every {POLL_SECONDS}s." if ALWAYS_POST else
+                                   "I'll post here whenever the price moves"
+                                   + (f" {MIN_CHANGE_PCT}% or more." if MIN_CHANGE_PCT else ".")),
                           color=discord.Color.blurple())
         if cur:
             e.add_field(name="Price now", value=fmt_price(cur["price"]))
@@ -638,8 +642,8 @@ async def handle_coin(coin_id, d, rows, prios):
     prev = last_posted.get(coin_id)
     if prev is None:
         last_posted[coin_id] = price
-    moved = (prev is not None and prev > 0 and price != prev
-             and abs(price - prev) / prev * 100 >= MIN_CHANGE_PCT)
+    moved = prev is not None and prev > 0 and (
+        ALWAYS_POST or (price != prev and abs(price - prev) / prev * 100 >= MIN_CHANGE_PCT))
     hits = [p for p in prios if (price >= p["target"] if p["direction"] == "up" else price <= p["target"])]
     if not moved and not hits:
         return
