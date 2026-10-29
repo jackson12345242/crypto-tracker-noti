@@ -338,6 +338,19 @@ async def track_coin(guild: discord.Guild, coin_id, symbol, name):
             reason="Coin tracker")
     await run("INSERT OR REPLACE INTO guild_coins VALUES(?,?,?,?,?)",
               (guild.id, coin_id, symbol.upper(), name, channel.id))
+    # Welcome post: shows the current price and proves the bot can post in the channel
+    try:
+        cur = (await kraken.prices([coin_id])).get(coin_id)
+        e = discord.Embed(title=f"📡 Tracking {name if name == symbol.upper() else f'{name} ({symbol.upper()})'}",
+                          description="I'll post here whenever the price moves"
+                                      + (f" {MIN_CHANGE_PCT}% or more." if MIN_CHANGE_PCT else "."),
+                          color=discord.Color.blurple())
+        if cur:
+            e.add_field(name="Price now", value=fmt_price(cur["price"]))
+        e.set_footer(text=FOOTER)
+        await channel.send(embed=e)
+    except Exception as err:
+        log.warning("Couldn't post in %s (needs View Channel, Send Messages, Embed Links): %s", channel.id, err)
     return channel
 
 
@@ -605,8 +618,8 @@ async def get_channel(row):
         return await bot.fetch_channel(row["channel_id"])
     except discord.NotFound:  # channel was deleted: stop tracking
         await untrack_coin(row["guild_id"], row["coin_id"])
-    except discord.HTTPException:
-        pass
+    except discord.HTTPException as e:
+        log.warning("Can't access tracker channel %s (check bot permissions): %s", row["channel_id"], e)
     return None
 
 
@@ -614,7 +627,8 @@ async def send_embed(dest, embed, content=None):
     try:
         await dest.send(content=content, embed=embed)
         return True
-    except discord.HTTPException:
+    except discord.HTTPException as e:
+        log.warning("Couldn't send to %s: %s", getattr(dest, "id", dest), e)
         return False
 
 
@@ -635,11 +649,13 @@ async def handle_coin(coin_id, d, rows, prios):
     if moved:
         last_posted[coin_id] = price
         embed_cache = {}
+        sent = 0
         for r in rows:
             ch = await get_channel(r)
             if ch:
                 e = embed_cache.setdefault(r["symbol"], move_embed(r, price, prev, ch24, analysis))
-                await send_embed(ch, e)
+                sent += await send_embed(ch, e)
+        log.info("%s moved %+.3f%% -> posted to %d channel(s)", coin_id, (price - prev) / prev * 100, sent)
 
     for p in hits:
         row = by_guild.get(p["guild_id"])
