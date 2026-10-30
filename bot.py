@@ -202,11 +202,36 @@ class Kraken:
         self.bad[cid] = time.time() + 600
         log.warning("Kraken has no ticker data for %s (%s); skipping it for 10 min", cid, err)
 
+    async def _fetch(self, url, **params):
+        if self.session is None:
+            self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
+        async with self.session.get(url, params=params) as r:
+            r.raise_for_status()
+            return await r.json()
+
+    async def _binance(self, ids):
+        """Fallback when Kraken's ticker fails: Binance's free public price list (USDT ~ USD)."""
+        wanted = {self.coins[c]["symbol"] + "USDT": c for c in ids}
+        try:
+            data = await self._fetch("https://api.binance.com/api/v3/ticker/price")
+        except Exception as e:
+            log.warning("Binance fallback failed: %s", e)
+            return {}
+        out = {}
+        for t in data:
+            cid = wanted.get(t["symbol"])
+            if cid:
+                out[cid] = {"price": float(t["price"]), "change24h": None}
+        if out:
+            log.info("Used Binance fallback for %d coin(s)", len(out))
+        return out
+
     async def prices(self, ids):
         """Batched ticker -> {coin_id: {price, change24h}} (change is vs today's 00:00 UTC open).
-        If Kraken rejects a batch, retry coin by coin so one bad market can't stop every alert."""
+        If Kraken rejects a batch, retry coin by coin; anything Kraken can't give falls back to Binance."""
         now = time.time()
-        ids = [i for i in ids if i in self.coins and self.bad.get(i, 0) < now]
+        wanted = [i for i in ids if i in self.coins]
+        ids = [i for i in wanted if self.bad.get(i, 0) < now]
         out = {}
         for i in range(0, len(ids), 50):
             chunk = ids[i:i + 50]
@@ -225,6 +250,9 @@ class Kraken:
                         if "Kraken error" not in str(e2):
                             raise
                         self._mark_bad(cid, e2)
+        missing = [c for c in wanted if c not in out]
+        if missing:
+            out.update(await self._binance(missing))
         return out
 
     async def closes(self, coin_id, interval=60, count=168):
