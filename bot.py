@@ -28,7 +28,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("cryptobot")
 
 TOKEN = os.environ["DISCORD_TOKEN"]
-POLL_SECONDS = max(5, int(os.getenv("POLL_SECONDS", "30")))
+POLL_SECONDS = max(5, int(os.getenv("POLL_SECONDS", "15")))
+DEFAULT_INTERVAL = 15  # seconds between channel updates unless a server changes it
+MIN_INTERVAL = 15
 ALWAYS_POST = os.getenv("ALWAYS_POST", "1") == "1"  # 1 = post every check, even if price is unchanged
 MIN_CHANGE_PCT = float(os.getenv("MIN_CHANGE_PCT", "0.1"))  # only used when ALWAYS_POST=0  # 0 = post on ANY change
 AI_CACHE_SECONDS = int(os.getenv("AI_CACHE_SECONDS", "600"))
@@ -94,6 +96,8 @@ async def init_db():
             guild_id INTEGER, user_id INTEGER, coin_id TEXT, target REAL, direction TEXT,
             PRIMARY KEY(guild_id, user_id, coin_id));
         CREATE TABLE IF NOT EXISTS allowed_guilds(guild_id INTEGER PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS guild_settings(
+            guild_id INTEGER PRIMARY KEY, min_change REAL, interval INTEGER);
         CREATE TABLE IF NOT EXISTS report_subs(
             guild_id INTEGER, user_id INTEGER, PRIMARY KEY(guild_id, user_id));
         CREATE TABLE IF NOT EXISTS daily(
@@ -411,9 +415,7 @@ async def track_coin(guild: discord.Guild, coin_id, symbol, name):
     try:
         cur = (await kraken.prices([coin_id])).get(coin_id)
         e = discord.Embed(title=f"📡 Tracking {name if name == symbol.upper() else f'{name} ({symbol.upper()})'}",
-                          description=(f"I'll post here every {POLL_SECONDS}s." if ALWAYS_POST else
-                                   "I'll post here whenever the price moves"
-                                   + (f" {MIN_CHANGE_PCT}% or more." if MIN_CHANGE_PCT else ".")),
+                          description="I'll post here based on this server's update settings (see /settings).",
                           color=discord.Color.blurple())
         if cur:
             e.add_field(name="Price now", value=fmt_price(cur["price"]))
@@ -567,6 +569,9 @@ async def settings_payload(guild_id, user_id):
     sub = bool(await q("SELECT 1 FROM report_subs WHERE guild_id=? AND user_id=?", (guild_id, user_id)))
     desc += "\n\n📰 **Daily report:** " + (
         "ON. I'll DM you a recap of every tracked coin at 00:00 UTC" if sub else "OFF")
+    mc, iv = await get_cfg(guild_id)
+    desc += f"\n\n📡 **Channel updates (whole server):** at most every {iv}s, " + (
+        "posting every time" if mc == 0 else f"only when the price moves {mc:g}% or more")
     embed = discord.Embed(title="⚙️ Your Settings", description=desc, color=discord.Color.blurple())
     embed.set_footer(text="When a coin hits your price, I'll DM you (make sure your DMs are open)")
     view = discord.ui.View(timeout=None)
@@ -575,7 +580,56 @@ async def settings_payload(guild_id, user_id):
     if mine:
         view.add_item(AlertRemove(mine))
     view.add_item(ReportToggle(sub))
+    view.add_item(UpdateButton(mc, iv))
     return embed, view
+
+
+async def get_cfg(guild_id):
+    rows = await q("SELECT * FROM guild_settings WHERE guild_id=?", (guild_id,))
+    return (rows[0]["min_change"], rows[0]["interval"]) if rows else (0.0, DEFAULT_INTERVAL)
+
+
+class UpdateModal(discord.ui.Modal, title="Channel update settings"):
+    pct = discord.ui.TextInput(label="Min % change to post (0 = every update)", max_length=8)
+    secs = discord.ui.TextInput(label=f"Seconds between updates (min {MIN_INTERVAL})", max_length=6)
+
+    def __init__(self, mc, iv):
+        super().__init__()
+        self.pct.default = f"{mc:g}"
+        self.secs.default = str(iv)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            mc = float(str(self.pct).replace("%", "").strip())
+            iv = int(float(str(self.secs).strip()))
+        except ValueError:
+            await interaction.response.send_message("Enter numbers, like `0.5` and `30`.", ephemeral=True)
+            return
+        if not 0 <= mc <= 100:
+            await interaction.response.send_message("The % change must be between 0 and 100.", ephemeral=True)
+            return
+        if iv < MIN_INTERVAL:
+            await interaction.response.send_message(
+                f"The minimum is {MIN_INTERVAL} seconds.", ephemeral=True)
+            return
+        iv = min(iv, 86400)
+        await interaction.response.defer()
+        await run("INSERT OR REPLACE INTO guild_settings VALUES(?,?,?)", (interaction.guild_id, mc, iv))
+        embed, view = await settings_payload(interaction.guild_id, interaction.user.id)
+        await interaction.edit_original_response(embed=embed, view=view)
+
+
+class UpdateButton(discord.ui.Button):
+    def __init__(self, mc, iv):
+        super().__init__(label="Channel updates", emoji="📡", row=3, style=discord.ButtonStyle.secondary)
+        self.mc, self.iv = mc, iv
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message(
+                "You need the **Manage Server** permission to change channel update settings.", ephemeral=True)
+            return
+        await interaction.response.send_modal(UpdateModal(self.mc, self.iv))
 
 
 class ReportToggle(discord.ui.Button):
@@ -798,7 +852,9 @@ bot.tree.add_command(coins_group)
 
 # ------------------------------------------------------------- price loop
 latest: dict[str, float] = {}       # newest price per coin
-last_posted: dict[str, float] = {}  # price at last channel post per coin
+last_posted: dict[str, float] = {}  # (unused now; kept for compatibility)
+guild_last: dict[tuple, tuple] = {}  # (guild, coin) -> (price, time) at that server's last post
+guild_cfg: dict[int, tuple] = {}     # guild -> (min % change, seconds between updates)
 poll_state = {"ok_at": None, "error": None, "prices": 0}
 
 
@@ -827,27 +883,37 @@ async def send_embed(dest, embed, content=None):
 async def handle_coin(coin_id, d, rows, prios):
     price, ch24 = d["price"], d["change24h"]
     latest[coin_id] = price
-    prev = last_posted.get(coin_id)
-    if prev is None:
-        last_posted[coin_id] = price
-    moved = prev is not None and prev > 0 and (
-        ALWAYS_POST or (price != prev and abs(price - prev) / prev * 100 >= MIN_CHANGE_PCT))
+    now = time.time()
+    due = []  # (row, price at this server's last post)
+    for r in rows:
+        key = (r["guild_id"], coin_id)
+        min_pct, interval = guild_cfg.get(r["guild_id"], (0.0, DEFAULT_INTERVAL))
+        last = guild_last.get(key)
+        if last is None:  # first sighting: just remember the price
+            guild_last[key] = (price, now)
+            continue
+        prev_price, prev_ts = last
+        if now - prev_ts < interval - 2:  # not time yet (2s slack for timing jitter)
+            continue
+        if min_pct > 0:
+            move = abs(price - prev_price) / prev_price * 100 if prev_price else 0.0
+            if price == prev_price or move < min_pct:
+                continue
+        due.append((r, prev_price))
     hits = [p for p in prios if (price >= p["target"] if p["direction"] == "up" else price <= p["target"])]
-    if not moved and not hits:
+    if not due and not hits:
         return
     analysis = await analyzer.get(coin_id, price)
     by_guild = {r["guild_id"]: r for r in rows}
 
-    if moved:
-        last_posted[coin_id] = price
-        embed_cache = {}
-        sent = 0
-        for r in rows:
-            ch = await get_channel(r)
-            if ch:
-                e = embed_cache.setdefault(r["symbol"], move_embed(r, price, prev, ch24, analysis))
-                sent += await send_embed(ch, e)
-        log.info("%s moved %+.3f%% -> posted to %d channel(s)", coin_id, (price - prev) / prev * 100, sent)
+    sent = 0
+    for r, prev_price in due:
+        guild_last[(r["guild_id"], coin_id)] = (price, now)
+        ch = await get_channel(r)
+        if ch:
+            sent += await send_embed(ch, move_embed(r, price, prev_price, ch24, analysis))
+    if due:
+        log.info("%s -> posted to %d/%d channel(s)", coin_id, sent, len(due))
 
     for p in hits:
         row = by_guild.get(p["guild_id"])
@@ -868,6 +934,9 @@ async def handle_coin(coin_id, d, rows, prios):
 async def run_poll():
     rows = [r for r in await q("SELECT * FROM guild_coins") if r["guild_id"] in ALLOWED_GUILD_IDS]
     prios = [p for p in await q("SELECT * FROM priorities") if p["guild_id"] in ALLOWED_GUILD_IDS]
+    guild_cfg.clear()
+    guild_cfg.update({c["guild_id"]: (c["min_change"], c["interval"])
+                      for c in await q("SELECT * FROM guild_settings")})
     ids = {r["coin_id"] for r in rows} | {p["coin_id"] for p in prios}
     if not ids:
         return
