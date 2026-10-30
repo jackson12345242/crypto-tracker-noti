@@ -117,6 +117,7 @@ class Kraken:
         self.coins: dict[str, dict] = {}     # coin_id (Kraken altname, e.g. XBTUSD) -> info
         self.key_to_id: dict[str, str] = {}  # key Kraken uses in responses -> coin_id
         self.loaded_at = 0.0
+        self.bad: dict[str, float] = {}      # coin_id -> skip-until timestamp
 
     async def get(self, path, **params):
         if self.session is None:
@@ -183,21 +184,47 @@ class Kraken:
         by_sym = {c["symbol"]: c for c in self.coins.values()}
         return [(by_sym[s]["id"], s, by_sym[s]["name"]) for s in POPULAR_SYMBOLS if s in by_sym]
 
+    async def _ticker(self, chunk):
+        out = {}
+        result = await self.get("Ticker", pair=",".join(chunk))
+        for key, t in result.items():
+            cid = self.key_to_id.get(key)
+            if not cid:
+                continue
+            price = float(t["c"][0])
+            o = t.get("o")
+            opening = float(o[0] if isinstance(o, list) else o) if o else 0.0
+            out[cid] = {"price": price,
+                        "change24h": (price / opening - 1) * 100 if opening else None}
+        return out
+
+    def _mark_bad(self, cid, err):
+        self.bad[cid] = time.time() + 600
+        log.warning("Kraken has no ticker data for %s (%s); skipping it for 10 min", cid, err)
+
     async def prices(self, ids):
-        """Batched ticker -> {coin_id: {price, change24h}} (change is vs today's 00:00 UTC open)."""
-        ids = [i for i in ids if i in self.coins]
+        """Batched ticker -> {coin_id: {price, change24h}} (change is vs today's 00:00 UTC open).
+        If Kraken rejects a batch, retry coin by coin so one bad market can't stop every alert."""
+        now = time.time()
+        ids = [i for i in ids if i in self.coins and self.bad.get(i, 0) < now]
         out = {}
         for i in range(0, len(ids), 50):
-            result = await self.get("Ticker", pair=",".join(ids[i:i + 50]))
-            for key, t in result.items():
-                cid = self.key_to_id.get(key)
-                if not cid:
+            chunk = ids[i:i + 50]
+            try:
+                out.update(await self._ticker(chunk))
+            except RuntimeError as e:
+                if "Kraken error" not in str(e):  # e.g. rate limit: let the loop retry next cycle
+                    raise
+                if len(chunk) == 1:
+                    self._mark_bad(chunk[0], e)
                     continue
-                price = float(t["c"][0])
-                o = t.get("o")
-                opening = float(o[0] if isinstance(o, list) else o) if o else 0.0
-                out[cid] = {"price": price,
-                            "change24h": (price / opening - 1) * 100 if opening else None}
+                for cid in chunk:
+                    try:
+                        out.update(await self._ticker([cid]))
+                    except RuntimeError as e2:
+                        if "Kraken error" not in str(e2):
+                            raise
+                        self._mark_bad(cid, e2)
         return out
 
     async def closes(self, coin_id, interval=60, count=168):
@@ -600,6 +627,29 @@ async def coins_list(interaction: discord.Interaction):
         file=discord.File(io.BytesIO(text.encode()), filename="supported_coins.txt"), ephemeral=True)
 
 
+@coins_group.command(name="test", description="Send a test post to every tracker channel and show bot status")
+async def coins_test(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("You need **Manage Server** for this.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    rows = await guild_rows(interaction.guild_id)
+    lines = []
+    for r in rows:
+        ch = await get_channel(r)
+        if not ch:
+            lines.append(f"❌ {r['symbol']}: can't access its channel")
+            continue
+        ok = await send_embed(ch, discord.Embed(title=f"✅ Test post: {disp(r)}", color=discord.Color.green()))
+        lines.append(f"{'✅' if ok else '❌ no permission'} {r['symbol']} → {ch.mention}")
+    ago = f"{int(time.time() - poll_state['ok_at'])}s ago" if poll_state["ok_at"] else "never"
+    lines.append(f"\nPrice loop running: {'yes' if poll_loop.is_running() else 'NO'} | "
+                 f"last successful check: {ago} | prices received: {poll_state['prices']}")
+    if poll_state["error"]:
+        lines.append(f"Last error: `{poll_state['error']}`")
+    await interaction.followup.send("\n".join(lines) if rows else "No coins tracked yet.", ephemeral=True)
+
+
 @bot.tree.command(name="settings", description="Set your priority price alerts")
 @app_commands.guild_only()
 async def settings(interaction: discord.Interaction):
@@ -612,6 +662,7 @@ bot.tree.add_command(coins_group)
 # ------------------------------------------------------------- price loop
 latest: dict[str, float] = {}       # newest price per coin
 last_posted: dict[str, float] = {}  # price at last channel post per coin
+poll_state = {"ok_at": None, "error": None, "prices": 0}
 
 
 async def get_channel(row):
@@ -685,6 +736,9 @@ async def run_poll():
         return
     await kraken.maybe_refresh()
     data = await kraken.prices(ids)
+    poll_state["prices"] = len(data)
+    if not data:
+        log.warning("Kraken returned no prices for %d tracked coin(s)", len(ids))
     rows_by, prios_by = defaultdict(list), defaultdict(list)
     for r in rows:
         rows_by[r["coin_id"]].append(r)
@@ -702,7 +756,9 @@ async def run_poll():
 async def poll_loop():
     try:
         await run_poll()
-    except Exception:
+        poll_state["ok_at"], poll_state["error"] = time.time(), None
+    except Exception as e:
+        poll_state["error"] = repr(e)[:300]
         log.exception("poll failed")
 
 
