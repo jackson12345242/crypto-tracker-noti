@@ -6,7 +6,7 @@ import logging
 import os
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
 
 import aiohttp
 import aiosqlite
@@ -20,9 +20,10 @@ try:
 except ImportError:  # AI is optional; falls back to RSI rules
     anthropic = None
 
-from whitelist import ALLOWED_GUILD_IDS
+from whitelist import ALLOWED_GUILD_IDS as _STATIC_ALLOWED
 
 load_dotenv()
+ALLOWED_GUILD_IDS = set(_STATIC_ALLOWED)  # whitelist.py + servers added with /whitelist
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("cryptobot")
 
@@ -34,6 +35,7 @@ AI_CACHE_SECONDS = int(os.getenv("AI_CACHE_SECONDS", "600"))
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5")
 DB_PATH = os.getenv("DB_PATH", "tracker.db")
+OWNER_ID = int(os.getenv("OWNER_ID", "645395932812279844"))  # only this user can use /whitelist
 
 POPULAR_SYMBOLS = ["BTC", "ETH", "SOL", "LTC", "XRP", "DOGE", "ADA", "AVAX", "LINK", "DOT"]
 NAMES = {
@@ -91,6 +93,12 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS priorities(
             guild_id INTEGER, user_id INTEGER, coin_id TEXT, target REAL, direction TEXT,
             PRIMARY KEY(guild_id, user_id, coin_id));
+        CREATE TABLE IF NOT EXISTS allowed_guilds(guild_id INTEGER PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS report_subs(
+            guild_id INTEGER, user_id INTEGER, PRIMARY KEY(guild_id, user_id));
+        CREATE TABLE IF NOT EXISTS daily(
+            day TEXT, coin_id TEXT, open REAL, high REAL, low REAL, last REAL,
+            PRIMARY KEY(day, coin_id));
         """
     )
     await db.commit()
@@ -194,7 +202,10 @@ class Kraken:
             price = float(t["c"][0])
             o = t.get("o")
             opening = float(o[0] if isinstance(o, list) else o) if o else 0.0
-            out[cid] = {"price": price,
+            def first(v):
+                return float(v[0] if isinstance(v, list) else v) if v else None
+            out[cid] = {"price": price, "open": opening or None,
+                        "high": first(t.get("h")), "low": first(t.get("l")),
                         "change24h": (price / opening - 1) * 100 if opening else None}
         return out
 
@@ -413,9 +424,17 @@ async def track_coin(guild: discord.Guild, coin_id, symbol, name):
     return channel
 
 
-async def untrack_coin(guild_id, coin_id):
+async def untrack_coin(guild_id, coin_id, delete_channel=True):
+    rows = await q("SELECT channel_id FROM guild_coins WHERE guild_id=? AND coin_id=?", (guild_id, coin_id))
     await run("DELETE FROM guild_coins WHERE guild_id=? AND coin_id=?", (guild_id, coin_id))
     await run("DELETE FROM priorities WHERE guild_id=? AND coin_id=?", (guild_id, coin_id))
+    if delete_channel and rows:
+        ch = bot.get_channel(rows[0]["channel_id"])
+        if ch:
+            try:
+                await ch.delete(reason="Coin is no longer tracked")
+            except discord.HTTPException as e:
+                log.warning("Couldn't delete channel %s: %s", rows[0]["channel_id"], e)
 
 
 async def guild_rows(guild_id):
@@ -424,7 +443,10 @@ async def guild_rows(guild_id):
 
 async def refresh_coins_message(interaction: discord.Interaction):
     rows = await guild_rows(interaction.guild_id)
-    await interaction.edit_original_response(embed=coins_embed(rows), view=CoinsView(rows))
+    try:
+        await interaction.edit_original_response(embed=coins_embed(rows), view=CoinsView(rows))
+    except discord.HTTPException:  # e.g. the message lived in the channel we just deleted
+        pass
 
 
 NEED_CHANNELS = "I'm missing the **Manage Channels** permission, so I can't create the tracker channel."
@@ -542,14 +564,35 @@ async def settings_payload(guild_id, user_id):
         desc = "No priority prices yet. Pick a coin below to set one."
     else:
         desc = "No coins are tracked in this server yet. Ask an admin to use `/coins tracked`."
-    embed = discord.Embed(title="⚙️ Your Priority Prices", description=desc, color=discord.Color.blurple())
+    sub = bool(await q("SELECT 1 FROM report_subs WHERE guild_id=? AND user_id=?", (guild_id, user_id)))
+    desc += "\n\n📰 **Daily report:** " + (
+        "ON. I'll DM you a recap of every tracked coin at 00:00 UTC" if sub else "OFF")
+    embed = discord.Embed(title="⚙️ Your Settings", description=desc, color=discord.Color.blurple())
     embed.set_footer(text="When a coin hits your price, I'll DM you (make sure your DMs are open)")
     view = discord.ui.View(timeout=None)
     if tracked:
         view.add_item(CoinPick(tracked))
     if mine:
         view.add_item(AlertRemove(mine))
+    view.add_item(ReportToggle(sub))
     return embed, view
+
+
+class ReportToggle(discord.ui.Button):
+    def __init__(self, on):
+        super().__init__(label=f"Daily report: {'ON' if on else 'OFF'}", emoji="📰", row=2,
+                         style=discord.ButtonStyle.success if on else discord.ButtonStyle.secondary)
+        self.on = on
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.on:
+            await run("DELETE FROM report_subs WHERE guild_id=? AND user_id=?",
+                      (interaction.guild_id, interaction.user.id))
+        else:
+            await run("INSERT OR REPLACE INTO report_subs VALUES(?,?)",
+                      (interaction.guild_id, interaction.user.id))
+        embed, view = await settings_payload(interaction.guild_id, interaction.user.id)
+        await interaction.response.edit_message(embed=embed, view=view)
 
 
 class PriceModal(discord.ui.Modal):
@@ -611,7 +654,7 @@ class GuardedTree(app_commands.CommandTree):
     """Blocks every slash command outside whitelisted servers."""
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.guild_id in ALLOWED_GUILD_IDS:
+        if interaction.guild_id in ALLOWED_GUILD_IDS or interaction.user.id == OWNER_ID:
             return True
         await interaction.response.send_message(
             "This server isn't licensed for this bot.", ephemeral=True)
@@ -625,9 +668,11 @@ class TrackerBot(discord.Client):
 
     async def setup_hook(self):
         await init_db()
+        ALLOWED_GUILD_IDS.update(r["guild_id"] for r in await q("SELECT guild_id FROM allowed_guilds"))
         await kraken.load_pairs()
         await self.tree.sync()
         poll_loop.start()
+        daily_report_loop.start()
 
     async def close(self):
         await kraken.close()
@@ -678,6 +723,70 @@ async def coins_test(interaction: discord.Interaction):
     await interaction.followup.send("\n".join(lines) if rows else "No coins tracked yet.", ephemeral=True)
 
 
+@bot.tree.command(name="whitelist", description="Owner only: allow the bot to join a server")
+@app_commands.describe(guild_id="ID of the server to allow")
+async def whitelist_cmd(interaction: discord.Interaction, guild_id: str):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Owner only.", ephemeral=True)
+        return
+    if not guild_id.strip().isdigit():
+        await interaction.response.send_message("That doesn't look like a server ID (numbers only).", ephemeral=True)
+        return
+    gid = int(guild_id.strip())
+    await run("INSERT OR IGNORE INTO allowed_guilds VALUES(?)", (gid,))
+    ALLOWED_GUILD_IDS.add(gid)
+    await interaction.response.send_message(
+        f"✅ Server `{gid}` is whitelisted. The bot can join it now.", ephemeral=True)
+
+
+@bot.tree.command(name="unwhitelist", description="Owner only: remove a server and make the bot leave it")
+@app_commands.describe(guild_id="ID of the server to remove")
+async def unwhitelist_cmd(interaction: discord.Interaction, guild_id: str):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Owner only.", ephemeral=True)
+        return
+    if not guild_id.strip().isdigit():
+        await interaction.response.send_message("That doesn't look like a server ID (numbers only).", ephemeral=True)
+        return
+    gid = int(guild_id.strip())
+    await run("DELETE FROM allowed_guilds WHERE guild_id=?", (gid,))
+    ALLOWED_GUILD_IDS.discard(gid)
+    note = " It's also listed in `whitelist.py`, so remove it there too." if gid in _STATIC_ALLOWED else ""
+    guild = bot.get_guild(gid)
+    if guild:
+        await guild.leave()
+    await interaction.response.send_message(f"✅ Removed `{gid}`." + note, ephemeral=True)
+
+
+@bot.tree.command(name="currentreport", description="Today's report so far for a tracked coin")
+@app_commands.describe(coin="Which tracked coin")
+@app_commands.guild_only()
+async def currentreport(interaction: discord.Interaction, coin: str):
+    rows = await guild_rows(interaction.guild_id)
+    t = coin.strip().lower()
+    row = next((r for r in rows if t in (r["coin_id"].lower(), r["symbol"].lower(), r["name"].lower())), None)
+    if not row:
+        await interaction.response.send_message(
+            "That coin isn't tracked in this server. Add it with `/coins tracked`.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    embed = await report_embed(row, utc_day(), final=False)
+    if embed:
+        await interaction.followup.send(embed=embed)
+    else:
+        await interaction.followup.send("No price data for today yet. Try again in a minute.")
+
+
+@currentreport.autocomplete("coin")
+async def currentreport_autocomplete(interaction: discord.Interaction, current: str):
+    if not interaction.guild_id:
+        return []
+    cur = current.lower()
+    return [app_commands.Choice(name=disp(r)[:100], value=r["coin_id"])
+            for r in await guild_rows(interaction.guild_id)
+            if cur in r["symbol"].lower() or cur in r["name"].lower()][:25]
+
+
 @bot.tree.command(name="settings", description="Set your priority price alerts")
 @app_commands.guild_only()
 async def settings(interaction: discord.Interaction):
@@ -700,7 +809,7 @@ async def get_channel(row):
     try:
         return await bot.fetch_channel(row["channel_id"])
     except discord.NotFound:  # channel was deleted: stop tracking
-        await untrack_coin(row["guild_id"], row["coin_id"])
+        await untrack_coin(row["guild_id"], row["coin_id"], delete_channel=False)
     except discord.HTTPException as e:
         log.warning("Can't access tracker channel %s (check bot permissions): %s", row["channel_id"], e)
     return None
@@ -765,6 +874,14 @@ async def run_poll():
     await kraken.maybe_refresh()
     data = await kraken.prices(ids)
     poll_state["prices"] = len(data)
+    day = utc_day()
+    await db.executemany(
+        "INSERT INTO daily(day,coin_id,open,high,low,last) VALUES(?,?,?,?,?,?) "
+        "ON CONFLICT(day,coin_id) DO UPDATE SET high=MAX(high,excluded.high), "
+        "low=MIN(low,excluded.low), last=excluded.last",
+        [(day, cid, d.get("open") or d["price"], max(d.get("high") or 0, d["price"]),
+          min(d.get("low") or d["price"], d["price"]), d["price"]) for cid, d in data.items()])
+    await db.commit()
     if not data:
         log.warning("Kraken returned no prices for %d tracked coin(s)", len(ids))
     rows_by, prios_by = defaultdict(list), defaultdict(list)
@@ -778,6 +895,77 @@ async def run_poll():
     for res in results:
         if isinstance(res, Exception):
             log.error("coin handler failed", exc_info=res)
+
+
+def utc_day(offset_minutes=0):
+    return (datetime.now(timezone.utc) + timedelta(minutes=offset_minutes)).strftime("%Y-%m-%d")
+
+
+async def report_embed(row, day, final):
+    stats = await q("SELECT * FROM daily WHERE day=? AND coin_id=?", (day, row["coin_id"]))
+    if not stats:
+        return None
+    st = stats[0]
+    o, last, hi, lo = st["open"], st["last"], st["high"], st["low"]
+    pct = (last / o - 1) * 100 if o else 0.0
+    e = discord.Embed(
+        title=f"{'📰 Daily report' if final else '🕒 Report so far'}: {disp(row)}",
+        description=f"{day} (UTC)",
+        color=discord.Color.green() if last >= o else discord.Color.red(),
+        timestamp=datetime.now(timezone.utc))
+    e.add_field(name="Started at", value=fmt_price(o))
+    e.add_field(name="Ended at" if final else "Now", value=fmt_price(last))
+    e.add_field(name="Change", value=f"{pct:+.2f}%")
+    e.add_field(name="High", value=fmt_price(hi))
+    e.add_field(name="Low", value=fmt_price(lo))
+    if lo:
+        e.add_field(name="Range", value=f"{(hi - lo) / lo * 100:.2f}%")
+    add_analysis(e, await analyzer.get(row["coin_id"], last))
+    e.set_footer(text=FOOTER)
+    return e
+
+
+async def send_daily_reports():
+    day = utc_day(-5)  # the UTC day that just ended
+    by_guild = defaultdict(list)
+    for sub in await q("SELECT * FROM report_subs"):
+        if sub["guild_id"] in ALLOWED_GUILD_IDS:
+            by_guild[sub["guild_id"]].append(sub["user_id"])
+    cache = {}
+    for gid, users in by_guild.items():
+        embeds = []
+        for r in await guild_rows(gid):
+            if r["coin_id"] not in cache:
+                cache[r["coin_id"]] = await report_embed(r, day, final=True)
+            if cache[r["coin_id"]]:
+                embeds.append(cache[r["coin_id"]])
+        if not embeds:
+            continue
+        guild = bot.get_guild(gid)
+        header = f"📰 Daily report for **{guild.name if guild else 'your server'}**"
+        for uid in users:
+            try:
+                user = bot.get_user(uid) or await bot.fetch_user(uid)
+                for i in range(0, len(embeds), 5):  # keep each message under Discord's size limit
+                    await user.send(content=header if i == 0 else None, embeds=embeds[i:i + 5])
+                    await asyncio.sleep(1)
+            except discord.HTTPException as e:
+                log.warning("Couldn't DM daily report to %s: %s", uid, e)
+    await run("DELETE FROM daily WHERE day < ?", (utc_day(-60 * 24 * 30),))
+    log.info("Daily reports sent for %s", day)
+
+
+@tasks.loop(time=dtime(hour=0, minute=0, tzinfo=timezone.utc))
+async def daily_report_loop():
+    try:
+        await send_daily_reports()
+    except Exception:
+        log.exception("daily report failed")
+
+
+@daily_report_loop.before_loop
+async def before_daily():
+    await bot.wait_until_ready()
 
 
 @tasks.loop(seconds=POLL_SECONDS)
